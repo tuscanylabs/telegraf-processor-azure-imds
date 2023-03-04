@@ -33,7 +33,7 @@ jobs:
         goarch: ['amd64', 'arm64']
     steps:
       - name: Checkout code
-        uses: actions/checkout@latest
+        uses: actions/checkout@v3
 
       - name: Set up Go
         uses: actions/setup-go@v3
@@ -47,7 +47,7 @@ jobs:
           GOARCH: ${{ matrix.goarch }}
 
       - name: Upload release assets
-        uses: actions/upload-release-asset@latest
+        uses: actions/upload-release-asset@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
