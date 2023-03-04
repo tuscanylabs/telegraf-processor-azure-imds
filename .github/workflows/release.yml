@@ -6,20 +6,6 @@ on:
     tags:
       - 'v[0-9]+.*'
 
-changelog:
-  categories:
-    - title: Breaking Changes 🛠
-      labels:
-        - Semver-Major
-        - breaking-change
-    - title: Features 🎉
-      labels:
-        - Semver-Minor
-        - enhancement
-    - title: Other Changes
-      labels:
-        - "*"
-
 jobs:
   release:
     runs-on: ubuntu-latest
