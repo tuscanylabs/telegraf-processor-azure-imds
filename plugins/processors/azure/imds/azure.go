@@ -5,13 +5,14 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"time"
+
+	"github.com/coocood/freecache"
 	"github.com/influxdata/telegraf"
 	"github.com/influxdata/telegraf/config"
 	"github.com/influxdata/telegraf/plugins/common/parallel"
 	"github.com/influxdata/telegraf/plugins/processors"
-	"github.com/patrickmn/go-cache"
 	"github.com/tuscanylabs/telegraf-processor-azure-imds/internal/imds"
-	"time"
 )
 
 //go:embed sample.conf
@@ -20,20 +21,29 @@ var sampleConfig string
 type AzureIMDSProcessor struct {
 	ImdsTags         []string        `toml:"imds_tags"`
 	Timeout          config.Duration `toml:"timeout"`
+	CacheTTL         config.Duration `toml:"cache_ttl"`
 	Ordered          bool            `toml:"ordered"`
 	MaxParallelCalls int             `toml:"max_parallel_calls"`
 	Log              telegraf.Logger `toml:"-"`
+	TagCacheSize     int             `toml:"tag_cache_size"`
+	LogCacheStats    bool            `toml:"log_cache_stats"`
 
-	imdsClient  *imds.Client
-	imdsTagsMap map[string]struct{}
-	parallel    parallel.Parallel
-	cache       *cache.Cache
+	tagCache *freecache.Cache
+
+	imdsClient          *imds.Client
+	imdsTagsMap         map[string]struct{}
+	parallel            parallel.Parallel
+	cancelCleanupWorker context.CancelFunc
+	workerContext       context.Context
 }
 
 const (
 	DefaultMaxOrderedQueueSize = 10_000
 	DefaultMaxParallelCalls    = 10
 	DefaultTimeout             = 10 * time.Second
+	DefaultCacheTTL            = 0 * time.Hour
+	DefaultCacheSize           = 1000
+	DefaultLogCacheStats       = false
 )
 
 var allowedImdsTags = map[string]struct{}{
@@ -57,6 +67,29 @@ func (r *AzureIMDSProcessor) Add(metric telegraf.Metric, _ telegraf.Accumulator)
 	return nil
 }
 
+func (r *AzureIMDSProcessor) logCacheStatistics() {
+	if r.tagCache == nil {
+		return
+	}
+
+	ticker := time.NewTicker(30 * time.Second)
+
+	for {
+		select {
+		case <-r.workerContext.Done():
+			return
+		case <-ticker.C:
+			r.Log.Debugf("cache: size=%d hit=%d miss=%d full=%d\n",
+				r.tagCache.EntryCount(),
+				r.tagCache.HitCount(),
+				r.tagCache.MissCount(),
+				r.tagCache.EvacuateCount(),
+			)
+			r.tagCache.ResetStatistics()
+		}
+	}
+}
+
 func (r *AzureIMDSProcessor) Init() error {
 	r.Log.Debug("Initializing Azure IMDS Processor")
 	if len(r.ImdsTags) == 0 {
@@ -73,17 +106,20 @@ func (r *AzureIMDSProcessor) Init() error {
 		return errors.New("no allowed metadata tags specified in configuration")
 	}
 
-	// Create a cache with a default expiration time of 5 minutes, and which
-	// purges expired items every 10 minutes.
-	//
-	// Cache will prevent hammering of the IMDS url which can result in throttling and unnecessary HTTP traffic which
-	// may be detected by instrumentation tools such as Pixie
-	r.cache = cache.New(5*time.Minute, 10*time.Minute)
-
 	return nil
 }
 
 func (r *AzureIMDSProcessor) Start(acc telegraf.Accumulator) error {
+	r.tagCache = freecache.NewCache(r.TagCacheSize)
+	if r.LogCacheStats {
+		go r.logCacheStatistics()
+	}
+
+	r.Log.Debugf("cache: size=%d\n", r.TagCacheSize)
+	if r.CacheTTL > 0 {
+		r.Log.Debugf("cache timeout: seconds=%d\n", int(time.Duration(r.CacheTTL).Seconds()))
+	}
+
 	r.imdsClient = imds.NewClient()
 
 	if r.Ordered {
@@ -99,35 +135,56 @@ func (r *AzureIMDSProcessor) Stop() {
 	if r.parallel != nil {
 		r.parallel.Stop()
 	}
+	r.cancelCleanupWorker()
 }
 
-func (r *AzureIMDSProcessor) asyncAdd(metric telegraf.Metric) []telegraf.Metric {
+func (r *AzureIMDSProcessor) LookupIMDSTags(metric telegraf.Metric) telegraf.Metric {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(r.Timeout))
 	defer cancel()
 
-	// Add IMDS Instance Identity Document tags.
-	if len(r.imdsTagsMap) > 0 {
-		iido, err := r.imdsClient.GetInstanceMetadata(
-			ctx,
-			&imds.GetInstanceMetadataInput{},
-		)
-		if err != nil {
-			r.Log.Errorf("Error when calling GetInstanceMetadata: %v", err)
-			return []telegraf.Metric{metric}
-		}
+	var tagsNotFound []string
 
-		for tag := range r.imdsTagsMap {
-			r.Log.Infof("Getting information for tag: %s", tag)
-			finding, found := r.cache.Get(tag)
-			if found {
-				metric.AddTag(tag, finding.(string))
-			} else {
-				if v := getTagFromInstanceIdentityDocument(iido, tag); v != "" {
-					metric.AddTag(tag, v)
-					r.cache.Set(tag, v, cache.DefaultExpiration)
-				}
+	for tag := range r.imdsTagsMap {
+		val, err := r.tagCache.Get([]byte(tag))
+		if err != nil {
+			tagsNotFound = append(tagsNotFound, tag)
+		} else {
+			metric.AddTag(tag, string(val))
+		}
+	}
+
+	if len(tagsNotFound) == 0 {
+		return metric
+	}
+
+	iido, err := r.imdsClient.GetInstanceMetadata(
+		ctx,
+		&imds.GetInstanceMetadataInput{},
+	)
+
+	if err != nil {
+		r.Log.Errorf("Error when calling GetInstanceMetadata: %v", err)
+		return metric
+	}
+
+	for _, tag := range tagsNotFound {
+		if v := getTagFromInstanceIdentityDocument(iido, tag); v != "" {
+			metric.AddTag(tag, v)
+			expiration := int(time.Duration(r.CacheTTL).Seconds())
+			err = r.tagCache.Set([]byte(tag), []byte(v), expiration)
+			if err != nil {
+				r.Log.Errorf("Error when setting IMDS tag cache value: %v", err)
 			}
 		}
+	}
+
+	return metric
+}
+
+func (r *AzureIMDSProcessor) asyncAdd(metric telegraf.Metric) []telegraf.Metric {
+	// Add IMDS Instance Identity Document tags.
+	if len(r.imdsTagsMap) > 0 {
+		metric = r.LookupIMDSTags(metric)
 	}
 
 	return []telegraf.Metric{metric}
@@ -140,10 +197,15 @@ func init() {
 }
 
 func newAzureIMDSProcessor() *AzureIMDSProcessor {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &AzureIMDSProcessor{
-		MaxParallelCalls: DefaultMaxParallelCalls,
-		Timeout:          config.Duration(DefaultTimeout),
-		imdsTagsMap:      make(map[string]struct{}),
+		MaxParallelCalls:    DefaultMaxParallelCalls,
+		TagCacheSize:        DefaultCacheSize,
+		Timeout:             config.Duration(DefaultTimeout),
+		CacheTTL:            config.Duration(DefaultCacheTTL),
+		imdsTagsMap:         make(map[string]struct{}),
+		workerContext:       ctx,
+		cancelCleanupWorker: cancel,
 	}
 }
 

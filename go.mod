@@ -3,6 +3,7 @@ module github.com/tuscanylabs/telegraf-processor-azure-imds
 go 1.19
 
 require (
+	github.com/coocood/freecache v1.2.2
 	github.com/influxdata/telegraf v1.25.3
 	github.com/stretchr/testify v1.8.1
 )
@@ -18,6 +19,7 @@ require (
 	github.com/benbjohnson/clock v1.3.0 // indirect
 	github.com/blues/jsonata-go v1.5.4 // indirect
 	github.com/cenkalti/backoff/v4 v4.2.0 // indirect
+	github.com/cespare/xxhash/v2 v2.2.0 // indirect
 	github.com/containerd/containerd v1.6.18 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/davecgh/go-spew v1.1.1 // indirect
@@ -47,7 +49,6 @@ require (
 	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/opencontainers/image-spec v1.1.0-rc2 // indirect
 	github.com/opencontainers/runc v1.1.3 // indirect
-	github.com/patrickmn/go-cache v2.1.0+incompatible // indirect
 	github.com/philhofer/fwd v1.1.1 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
